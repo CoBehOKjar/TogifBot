@@ -403,7 +403,12 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    if bot.user in message.mentions and not message.content.startswith(COMMAND_PREFIX):
+    # Важно: проверяем именно ЯВНОЕ упоминание в тексте (<@id>), а не message.mentions —
+    # Discord автоматически добавляет туда автора сообщения при обычном reply-пинге,
+    # даже если в тексте нет буквального @упоминания. Из-за этого бот реагировал
+    # на любой ответ на своё собственное сообщение.
+    explicitly_mentioned = re.search(MENTION_RE_TEMPLATE.format(bot.user.id), message.content) is not None
+    if explicitly_mentioned and not message.content.startswith(COMMAND_PREFIX):
         context = (
             f"mention, user={message.author} ({message.author.id}), "
             f"guild={message.guild.id if message.guild else 'DM'}, channel={message.channel.id}"
