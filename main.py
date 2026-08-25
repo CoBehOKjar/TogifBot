@@ -10,6 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import soyball
 import togif
 
 try:
@@ -160,6 +161,7 @@ async def on_message(message: discord.Message):
         return
 
     await bot.process_commands(message)
+    await soyball.maybe_transfer_role(message)
 
     # Важно: проверяем именно ЯВНОЕ упоминание в тексте (<@id>), а не message.mentions —
     # Discord автоматически добавляет туда автора сообщения при обычном reply-пинге,
