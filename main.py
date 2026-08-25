@@ -20,8 +20,6 @@ except ImportError:
     pass
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
-SOYA_HASH=os.environ.get("TARGET_HASH")
-SOYA_ROLE_ID=os.environ.get("ROLE_ID")
 COMMAND_PREFIX = "!"
 LOG_DIR = os.environ.get("LOG_DIR", "logs")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
