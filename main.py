@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import asyncio
-import io
 import logging
 import os
 import re
-import time
 from logging.handlers import RotatingFileHandler
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-from PIL import Image, ImageSequence
-import pytesseract
+
+import togif
 
 try:
     from dotenv import load_dotenv
@@ -23,12 +20,16 @@ except ImportError:
     pass
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
+SOYA_HASH=os.environ.get("TARGET_HASH")
+SOYA_ROLE_ID=os.environ.get("ROLE_ID")
 COMMAND_PREFIX = "!"
 LOG_DIR = os.environ.get("LOG_DIR", "logs")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # ---------------------------------------------------------------------------
-# Настройка логирования: консоль + файл с ротацией (5 файлов по 5 МБ)
+# Настройка логирования: консоль + файл с ротацией (5 файлов по 5 МБ).
+# Настраивается на root logger - модуль togif.py (и любые другие) автоматически
+# наследуют эти хендлеры через стандартный механизм propagation logging.
 # ---------------------------------------------------------------------------
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -54,313 +55,15 @@ root_logger.setLevel(LOG_LEVEL)
 root_logger.addHandler(console_handler)
 root_logger.addHandler(file_handler)
 
+# discord.py сам по себе очень многословный на DEBUG/INFO - приглушаем его чуть выше нашего уровня
 logging.getLogger("discord").setLevel(logging.WARNING)
 logging.getLogger("discord.http").setLevel(logging.WARNING)
 
-log = logging.getLogger("gif-bot")
-
-IMAGE_EXT_RE = re.compile(r"\.(png|jpe?g|webp|bmp|gif|tiff?)(\?.*)?$", re.IGNORECASE)
-URL_RE = re.compile(r"https?://\S+")
-MESSAGE_LINK_RE = re.compile(
-    r"https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
-    r"(?P<guild>\d+|@me)/(?P<channel>\d+)/(?P<message>\d+)"
-)
-MENTION_RE_TEMPLATE = r"<@!?{0}>"
+log = logging.getLogger("main")
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
-
-
-class ImageNotFound(Exception):
-    """Не удалось найти изображение по указанным источникам."""
-
-
-# ---------------------------------------------------------------------------
-# Утилиты текста: Транслит и OCR
-# ---------------------------------------------------------------------------
-
-CYRILLIC_TO_LATIN = {
-    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e',
-    'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
-    'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
-    'ф': 'f', 'х': 'h', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
-    'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya'
-}
-
-
-def make_slug(text: str) -> str:
-    if not text:
-        return ""
-    text = text.lower()
-    transliterated = "".join(CYRILLIC_TO_LATIN.get(c, c) for c in text)
-    transliterated = re.sub(r'\s+', '_', transliterated)
-    slug = re.sub(r'[^a-z0-9_]', '', transliterated)
-    slug = re.sub(r'_+', '_', slug).strip('_')
-    return slug[:50]  # ограничиваем длину, чтобы не было гигантских названий
-
-
-def extract_text_from_image(data: bytes) -> str:
-    try:
-        img = Image.open(io.BytesIO(data))
-        img.seek(0)
-        img = img.convert("RGB")
-        try:
-            text = pytesseract.image_to_string(img, lang="rus+eng")
-        except pytesseract.TesseractError:
-            log.warning("Пакет языков 'rus' не найден, пробую дефолтный.")
-            text = pytesseract.image_to_string(img)
-        return text.strip()
-    except Exception as e:
-        log.warning(f"Ошибка при попытке OCR: {e}")
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# Поиск и загрузка изображения
-# ---------------------------------------------------------------------------
-
-async def download_bytes(session: aiohttp.ClientSession, url: str) -> bytes:
-    log.debug(f"Скачиваю файл по ссылке: {url}")
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status != 200:
-                log.warning(f"Скачивание не удалось ({resp.status}): {url}")
-                raise ImageNotFound(f"Не удалось скачать файл по ссылке (код {resp.status}).")
-            ctype = resp.headers.get("Content-Type", "")
-            if not ctype.startswith("image/") and not IMAGE_EXT_RE.search(url):
-                log.warning(f"Ссылка не похожа на изображение (Content-Type={ctype!r}): {url}")
-                raise ImageNotFound("По указанной ссылке нет изображения.")
-            data = await resp.read()
-            log.debug(f"Скачано {len(data)} байт, Content-Type={ctype!r}")
-            return data
-    except asyncio.TimeoutError:
-        log.warning(f"Таймаут при скачивании: {url}")
-        raise ImageNotFound("Превышено время ожидания при скачивании файла.")
-    except aiohttp.ClientError as e:
-        log.warning(f"Ошибка сети при скачивании {url}: {e}")
-        raise ImageNotFound(f"Ошибка сети при скачивании файла: {e}")
-
-
-def strip_mention(text: str, bot_id: int) -> str:
-    return re.sub(MENTION_RE_TEMPLATE.format(bot_id), "", text or "").strip()
-
-
-def extract_url_from_text(text: str) -> str | None:
-    if not text:
-        return None
-    candidates = [m.group(0) for m in URL_RE.finditer(text) if not MESSAGE_LINK_RE.match(m.group(0))]
-    for url in candidates:
-        if IMAGE_EXT_RE.search(url):
-            return url
-    return candidates[0] if candidates else None
-
-
-def extract_message_link(text: str):
-    if not text:
-        return None
-    m = MESSAGE_LINK_RE.search(text)
-    if not m:
-        return None
-    guild_raw = m.group("guild")
-    guild_id = None if guild_raw == "@me" else int(guild_raw)
-    return guild_id, int(m.group("channel")), int(m.group("message"))
-
-
-async def image_from_message(message: discord.Message, session: aiohttp.ClientSession) -> bytes | None:
-    for att in message.attachments:
-        if (att.content_type and att.content_type.startswith("image/")) or IMAGE_EXT_RE.search(att.filename or ""):
-            log.info(f"Найдено вложение в сообщении {message.id}: {att.filename} ({att.size} байт)")
-            return await att.read()
-
-    for embed in message.embeds:
-        if embed.image and embed.image.url:
-            log.info(f"Найдена картинка в embed сообщения {message.id}")
-            return await download_bytes(session, embed.image.url)
-        if embed.thumbnail and embed.thumbnail.url:
-            log.info(f"Найден thumbnail в embed сообщения {message.id}")
-            return await download_bytes(session, embed.thumbnail.url)
-
-    url = extract_url_from_text(message.content)
-    if url:
-        log.info(f"Найдена ссылка на картинку в тексте сообщения {message.id}: {url}")
-        return await download_bytes(session, url)
-    return None
-
-
-async def image_from_link(bot: commands.Bot, session: aiohttp.ClientSession, link) -> bytes | None:
-    _, channel_id, message_id = link
-    log.info(f"Перехожу по ссылке на сообщение: channel={channel_id}, message={message_id}")
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        target_message = await channel.fetch_message(message_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-        log.warning(f"Не удалось получить сообщение по ссылке (channel={channel_id}, message={message_id}): {e}")
-        return None
-    return await image_from_message(target_message, session)
-
-
-async def resolve_image(
-        bot: commands.Bot,
-        session: aiohttp.ClientSession,
-        *,
-        message: discord.Message | None = None,
-        url_hint: str | None = None,
-        attachment: discord.Attachment | None = None,
-) -> bytes:
-    if attachment is not None:
-        log.info(f"Источник изображения: явное вложение параметра ({attachment.filename})")
-        return await attachment.read()
-
-    if url_hint:
-        link = extract_message_link(url_hint)
-        if link:
-            log.info(f"Источник изображения: явная ссылка на сообщение ({url_hint})")
-            img = await image_from_link(bot, session, link)
-            if img:
-                return img
-        else:
-            log.info(f"Источник изображения: явная ссылка на файл ({url_hint})")
-            return await download_bytes(session, url_hint)
-
-    if message is not None:
-        img = await image_from_message(message, session)
-        if img:
-            return img
-
-        link = extract_message_link(message.content)
-        if link:
-            img = await image_from_link(bot, session, link)
-            if img:
-                return img
-
-        if message.reference is not None:
-            log.info(f"Проверяю сообщение, на которое ответили (message.reference)")
-            ref = message.reference.resolved
-            if ref is None or isinstance(ref, discord.DeletedReferencedMessage):
-                try:
-                    ref = await message.channel.fetch_message(message.reference.message_id)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"Не удалось получить сообщение из reply: {e}")
-                    ref = None
-            if ref:
-                img = await image_from_message(ref, session)
-                if img:
-                    return img
-
-    log.info("Изображение не найдено ни по одному из источников")
-    raise ImageNotFound(
-        "Не нашёл изображение\n"
-        "Прикрепи картинку, укажи ссылку на неё, вставь ссылку на сообщение с картинкой "
-        "или ответь (не работает для слеш-команд) на сообщение с картинкой."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Конвертация в GIF
-# ---------------------------------------------------------------------------
-
-ALPHA_THRESHOLD = 128
-
-
-def _to_p_frame_with_transparency(frame: Image.Image) -> Image.Image:
-    frame = frame.convert("RGBA")
-    alpha = frame.split()[3]
-    transparent_mask = alpha.point(lambda a: 255 if a < ALPHA_THRESHOLD else 0)
-
-    p_frame = frame.convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=255)
-    p_frame.paste(255, transparent_mask)
-    p_frame.info["transparency"] = 255
-    return p_frame
-
-
-def convert_to_gif(data: bytes) -> io.BytesIO:
-    start = time.monotonic()
-    src = Image.open(io.BytesIO(data))
-    output = io.BytesIO()
-
-    try:
-        n_frames = getattr(src, "n_frames", 1)
-    except Exception:
-        n_frames = 1
-
-    log.info(
-        f"Конвертирую изображение: формат={src.format}, размер={src.size}, кадров={n_frames}, вход={len(data)} байт")
-
-    if n_frames > 1:
-        frames = []
-        durations = []
-        for frame in ImageSequence.Iterator(src):
-            durations.append(frame.info.get("duration", 100))
-            frames.append(_to_p_frame_with_transparency(frame))
-        frames[0].save(
-            output,
-            format="GIF",
-            save_all=True,
-            append_images=frames[1:],
-            duration=durations,
-            loop=0,
-            disposal=2,
-            transparency=255,
-        )
-    else:
-        p_frame = _to_p_frame_with_transparency(src)
-        p_frame.save(output, format="GIF", transparency=255, disposal=2)
-
-    output.seek(0)
-    elapsed = time.monotonic() - start
-    size = output.getbuffer().nbytes
-    log.info(f"Конвертация завершена за {elapsed:.2f} сек, выход={size} байт")
-    return output
-
-
-# ---------------------------------------------------------------------------
-# Общая логика запуска конвертации
-# ---------------------------------------------------------------------------
-
-async def run_conversion(
-        session: aiohttp.ClientSession,
-        respond,
-        *,
-        message: discord.Message | None = None,
-        url_hint: str | None = None,
-        attachment: discord.Attachment | None = None,
-        filename_hint: str | None = None,
-        context: str = "",
-) -> None:
-    log.info(
-        f"Запрос на конвертацию [{context}]: url_hint={url_hint!r}, attachment={bool(attachment)}, filename={filename_hint}")
-    try:
-        data = await resolve_image(bot, session, message=message, url_hint=url_hint, attachment=attachment)
-    except ImageNotFound as e:
-        log.info(f"Изображение не найдено [{context}]")
-        await respond(str(e), None)
-        return
-
-    # Формируем имя файла
-    final_filename = "converted"
-    if filename_hint:
-        slug = make_slug(filename_hint)
-        if slug:
-            final_filename = slug
-
-    # Если имя не передали - пробуем OCR
-    if final_filename == "converted":
-        ocr_text = await asyncio.to_thread(extract_text_from_image, data)
-        if ocr_text:
-            slug = make_slug(ocr_text)
-            if slug:
-                final_filename = slug
-
-    try:
-        gif_buffer = await asyncio.to_thread(convert_to_gif, data)
-    except Exception as e:
-        log.exception(f"Ошибка при конвертации изображения [{context}]")
-        await respond(f"Не получилось сконвертировать изображение: {e}", None)
-        return
-
-    log.info(f"Успешно отправляю результат [{context}] как {final_filename}.gif")
-    await respond(None, discord.File(gif_buffer, filename=f"{final_filename}.gif"))
 
 
 # ---------------------------------------------------------------------------
@@ -370,10 +73,13 @@ async def run_conversion(
 @bot.command(name="togif", aliases=["gif"])
 async def togif_prefix(ctx: commands.Context, *, text: str = ""):
     """!togif [ссылка] [имя] — конвертирует изображение в GIF."""
-    context = f"prefix, user={ctx.author} ({ctx.author.id}), guild={ctx.guild.id if ctx.guild else 'DM'}, channel={ctx.channel.id}"
+    context = (
+        f"prefix, user={ctx.author} ({ctx.author.id}), "
+        f"guild={ctx.guild.id if ctx.guild else 'DM'}, channel={ctx.channel.id}"
+    )
     log.info(f"Команда !togif вызвана: {context}")
 
-    url = extract_url_from_text(text)
+    url = togif.extract_url_from_text(text)
     filename_hint = text.replace(url, "", 1).strip() if url else text.strip()
 
     async with ctx.typing(), aiohttp.ClientSession() as session:
@@ -383,12 +89,12 @@ async def togif_prefix(ctx: commands.Context, *, text: str = ""):
             else:
                 await ctx.reply(file=file, mention_author=False)
 
-        await run_conversion(
-            session, respond,
+        await togif.run_conversion(
+            bot, session, respond,
             message=ctx.message,
             url_hint=url,
             filename_hint=filename_hint,
-            context=context
+            context=context,
         )
 
 
@@ -396,13 +102,13 @@ async def togif_prefix(ctx: commands.Context, *, text: str = ""):
 @app_commands.describe(
     attachment="Прикреплённая картинка",
     url="Ссылка на картинку или ссылка на сообщение с картинкой",
-    filename="Название для гифки"
+    filename="Название для гифки",
 )
 async def togif_slash(
-        interaction: discord.Interaction,
-        attachment: discord.Attachment | None = None,
-        url: str | None = None,
-        filename: str | None = None,
+    interaction: discord.Interaction,
+    attachment: discord.Attachment | None = None,
+    url: str | None = None,
+    filename: str | None = None,
 ):
     context = (
         f"slash, user={interaction.user} ({interaction.user.id}), "
@@ -417,17 +123,23 @@ async def togif_slash(
             else:
                 await interaction.followup.send(file=file)
 
-        await run_conversion(
-            session, respond,
+        await togif.run_conversion(
+            bot, session, respond,
             url_hint=url,
             attachment=attachment,
             filename_hint=filename,
-            context=context
+            context=context,
         )
 
 
 @bot.tree.context_menu(name="Convert to GIF")
 async def togif_context_menu(interaction: discord.Interaction, message: discord.Message):
+    """
+    Контекстное меню сообщения (ПКМ по сообщению -> Apps -> Convert to GIF).
+    В отличие от /togif, здесь есть прямой доступ к тому сообщению, по которому
+    кликнули - reply-логика тут не нужна, картинка ищется прямо в нём.
+    Название файла в контекстном меню всегда определяется через OCR (или "converted").
+    """
     context = (
         f"context_menu, user={interaction.user} ({interaction.user.id}), "
         f"guild={interaction.guild_id or 'DM'}, channel={interaction.channel_id}, target_message={message.id}"
@@ -441,8 +153,7 @@ async def togif_context_menu(interaction: discord.Interaction, message: discord.
             else:
                 await interaction.followup.send(file=file)
 
-        # Для контекстного меню имя файла всегда будет парситься через OCR
-        await run_conversion(session, respond, message=message, context=context)
+        await togif.run_conversion(bot, session, respond, message=message, context=context)
 
 
 @bot.event
@@ -452,7 +163,10 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-    explicitly_mentioned = re.search(MENTION_RE_TEMPLATE.format(bot.user.id), message.content) is not None
+    # Важно: проверяем именно ЯВНОЕ упоминание в тексте (<@id>), а не message.mentions —
+    # Discord автоматически добавляет туда автора сообщения при обычном reply-пинге,
+    # даже если в тексте нет буквального @упоминания.
+    explicitly_mentioned = re.search(togif.MENTION_RE_TEMPLATE.format(bot.user.id), message.content) is not None
     if explicitly_mentioned and not message.content.startswith(COMMAND_PREFIX):
         context = (
             f"mention, user={message.author} ({message.author.id}), "
@@ -460,8 +174,8 @@ async def on_message(message: discord.Message):
         )
         log.info(f"Бот упомянут: {context}")
 
-        text = strip_mention(message.content, bot.user.id)
-        url = extract_url_from_text(text)
+        text = togif.strip_mention(message.content, bot.user.id)
+        url = togif.extract_url_from_text(text)
         filename_hint = text.replace(url, "", 1).strip() if url else text.strip()
 
         async with message.channel.typing(), aiohttp.ClientSession() as session:
@@ -471,17 +185,18 @@ async def on_message(message: discord.Message):
                 else:
                     await message.reply(file=file, mention_author=False)
 
-            await run_conversion(
-                session, respond,
+            await togif.run_conversion(
+                bot, session, respond,
                 message=message,
                 url_hint=url,
                 filename_hint=filename_hint,
-                context=context
+                context=context,
             )
 
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """Ловит ошибки !команд, которые не были обработаны внутри самой команды."""
     if isinstance(error, commands.CommandNotFound):
         return
     log.exception(f"Необработанная ошибка команды {ctx.command}: {error}", exc_info=error)
@@ -493,6 +208,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Ловит ошибки /команд, которые не были обработаны внутри самой команды."""
     log.exception(f"Необработанная ошибка слэш-команды {interaction.command}: {error}", exc_info=error)
     try:
         if interaction.response.is_done():
@@ -535,7 +251,7 @@ def main():
         )
     log.info("Запускаю бота...")
     try:
-        bot.run(TOKEN, log_handler=None)
+        bot.run(TOKEN, log_handler=None)  # логирование уже настроено вручную выше
     except discord.LoginFailure:
         log.critical("Неверный токен бота (LoginFailure). Проверь DISCORD_TOKEN в .env.")
         raise
