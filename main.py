@@ -5,20 +5,23 @@ import os
 import re
 from logging.handlers import RotatingFileHandler
 
-import aiohttp
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-import soyball
-import togif
-
+# load_dotenv() ОБЯЗАТЕЛЬНО до импорта togif/role_transfer - они читают os.environ
+# на уровне модуля (при импорте), а не при вызове функций. Если .env загрузить
+# позже, эти модули просто не увидят переменные и решат, что они не заданы.
 try:
     from dotenv import load_dotenv
 
     load_dotenv()
 except ImportError:
     pass
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import togif
+import soyball
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 COMMAND_PREFIX = "!"
@@ -192,6 +195,20 @@ async def on_message(message: discord.Message):
                 filename_hint=filename_hint,
                 context=context,
             )
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    """
+    Discord часто добавляет embed НЕ сразу при отправке сообщения, а отдельным
+    событием редактирования (пока сам подгружает превью ссылки на Tenor/GIPHY
+    и т.п.). Поэтому передачу роли по гифке-ссылке нужно перепроверять и здесь,
+    иначе такие сообщения (98% реальных гифок - это именно ссылки) будут пропущены.
+    """
+    if after.author.bot:
+        return
+    if not before.embeds and after.embeds:
+        await role_transfer.maybe_transfer_role(after)
 
 
 @bot.event
