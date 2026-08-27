@@ -22,6 +22,7 @@ from discord.ext import commands
 
 import togif
 import soyball
+import renamer
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 COMMAND_PREFIX = "!"
@@ -257,6 +258,7 @@ async def on_ready():
         f"Бот запущен как {bot.user} (id: {bot.user.id}), "
         f"на серверах: {len(bot.guilds)}, задержка: {bot.latency * 1000:.0f} мс"
     )
+    renamer.start(bot)
 
 
 def main():
