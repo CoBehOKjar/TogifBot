@@ -61,11 +61,11 @@ if _target_hash_raw:
     try:
         TARGET_HASH = imagehash.hex_to_hash(_target_hash_raw)
     except ValueError:
-        log.error(f"role_transfer: TARGET_HASH некорректен ({_target_hash_raw!r}), модуль отключён")
+        log.error(f"soyball: TARGET_HASH некорректен ({_target_hash_raw!r}), модуль отключён")
 
 if TARGET_HASH is None or ROLE_ID is None:
     log.warning(
-        "role_transfer: TARGET_HASH или ROLE_ID не заданы (или некорректны) в .env - "
+        "soyball: TARGET_HASH или ROLE_ID не заданы (или некорректны) в .env - "
         "передача роли по гифке отключена."
     )
 
@@ -129,17 +129,17 @@ async def _matches_target_gif(message: discord.Message) -> bool:
             try:
                 data = await attachment.read() if attachment is not None else await _download(session, url)
             except (discord.HTTPException, aiohttp.ClientError, asyncio.TimeoutError) as e:
-                log.warning(f"role_transfer: не удалось получить {label}: {e}")
+                log.warning(f"soyball: не удалось получить {label}: {e}")
                 continue
 
             try:
                 file_hash = await asyncio.to_thread(compute_perceptual_hash, data)
             except Exception:
-                log.exception(f"role_transfer: не удалось вычислить хэш для {label}")
+                log.exception(f"soyball: не удалось вычислить хэш для {label}")
                 continue
 
             diff = file_hash - TARGET_HASH  # расстояние Хэмминга между хэшами
-            log.debug(f"role_transfer: разница хэшей для {label}: {diff} (порог {HASH_THRESHOLD})")
+            log.debug(f"soyball: разница хэшей для {label}: {diff} (порог {HASH_THRESHOLD})")
             if diff <= HASH_THRESHOLD:
                 return True
 
@@ -152,7 +152,7 @@ async def _get_reply_target(message: discord.Message) -> discord.Message | None:
         try:
             ref = await message.channel.fetch_message(message.reference.message_id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"role_transfer: не удалось получить сообщение из reply: {e}")
+            log.warning(f"soyball: не удалось получить сообщение из reply: {e}")
             return None
     return ref
 
@@ -177,7 +177,7 @@ async def maybe_transfer_role(message: discord.Message) -> None:
 
     giver = message.author  # discord.Member в контексте сервера
     if giver.bot:
-        log.info("role_transfer: гифка-триггер отправлена ботом - игнорирую")
+        log.info("soyball: гифка-триггер отправлена ботом - игнорирую")
         return
 
     ref_message = await _get_reply_target(message)
@@ -186,32 +186,32 @@ async def maybe_transfer_role(message: discord.Message) -> None:
 
     receiver = ref_message.author
     if receiver.bot:
-        log.info("role_transfer: получатель роли - бот, передача запрещена")
+        log.info("soyball: получатель роли - бот, передача запрещена")
         return
 
     if receiver.id == giver.id:
-        log.info("role_transfer: пользователь ответил сам себе - передавать нечего")
+        log.info("soyball: пользователь ответил сам себе - передавать нечего")
         return
 
     guild = message.guild
     role = guild.get_role(ROLE_ID)
     if role is None:
-        log.warning(f"role_transfer: роль с ID {ROLE_ID} не найдена на сервере {guild.id}")
+        log.warning(f"soyball: роль с ID {ROLE_ID} не найдена на сервере {guild.id}")
         return
 
     try:
         giver_member = guild.get_member(giver.id) or await guild.fetch_member(giver.id)
         receiver_member = guild.get_member(receiver.id) or await guild.fetch_member(receiver.id)
     except discord.NotFound:
-        log.warning("role_transfer: не удалось получить участников сервера")
+        log.warning("soyball: не удалось получить участников сервера")
         return
 
     if role not in giver_member.roles:
-        log.debug("role_transfer: у отправителя гифки нет этой роли - передача не требуется")
+        log.debug("soyball: у отправителя гифки нет этой роли - передача не требуется")
         return
 
     if role in receiver_member.roles:
-        log.debug("role_transfer: у получателя роль уже есть - передача не требуется")
+        log.debug("soyball: у получателя роль уже есть - передача не требуется")
         return
 
     try:
@@ -219,12 +219,12 @@ async def maybe_transfer_role(message: discord.Message) -> None:
         await receiver_member.add_roles(role, reason="Передача роли через гифку-триггер")
     except discord.Forbidden:
         log.error(
-            "role_transfer: не хватает прав для передачи роли. Проверь, что у бота есть "
+            "soyball: не хватает прав для передачи роли. Проверь, что у бота есть "
             "право Manage Roles и его собственная роль стоит ВЫШЕ передаваемой в иерархии."
         )
         return
     except discord.HTTPException:
-        log.exception("role_transfer: ошибка Discord API при передаче роли")
+        log.exception("soyball: ошибка Discord API при передаче роли")
         return
 
-    log.info(f"role_transfer: роль {role.name} ({role.id}) передана: {giver_member} -> {receiver_member}")
+    log.info(f"soyball: роль {role.name} ({role.id}) передана: {giver_member} -> {receiver_member}")

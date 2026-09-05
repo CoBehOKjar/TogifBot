@@ -209,7 +209,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if after.author.bot:
         return
     if not before.embeds and after.embeds:
-        await role_transfer.maybe_transfer_role(after)
+        await soyball.maybe_transfer_role(after)
 
 
 @bot.event
