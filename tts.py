@@ -248,6 +248,9 @@ class GuildPlayer:
                         log.error(f"tts: ошибка воспроизведения: {error}")
                     loop.call_soon_threadsafe(done.set)
 
+                problems = voice_problems(self.vc.guild, self.vc.channel)
+                if problems:
+                    log.warning("tts: бота, скорее всего, не будет слышно: " + "; ".join(problems))
                 log.info("tts: начинаю воспроизведение")
                 self.vc.play(source, after=_after)
                 await done.wait()  # следующее сообщение - только после конца текущего
@@ -256,6 +259,23 @@ class GuildPlayer:
                 raise
             except Exception:
                 log.exception("Ошибка озвучки")
+
+
+def voice_problems(guild: discord.Guild, channel) -> list:
+    """Причины, по которым бота не будет слышно, даже если озвучка технически работает."""
+    problems = []
+    me = guild.me
+    if me is None:
+        return problems
+    if not channel.permissions_for(me).speak:
+        problems.append("у бота нет права «Говорить» (Speak) в этом канале (проверь и роль, и права самого канала)")
+    state = me.voice
+    if state is not None:
+        if state.mute:
+            problems.append("бот замьючен сервером (server mute)")
+        if state.suppress:
+            problems.append("бот подавлен (suppress): это Stage-канал, бота нужно пригласить выступать")
+    return problems
 
 
 players: dict[int, GuildPlayer] = {}
@@ -399,7 +419,12 @@ async def join(interaction: discord.Interaction):
     else:
         players[guild.id] = GuildPlayer(vc, channel.id)
     log.info(f"tts: подключился к каналу {channel.name} ({channel.id}) на сервере {guild.id}")
-    await interaction.followup.send(f"Подключился к **{channel.name}**.", ephemeral=True)
+    reply = f"Подключился к **{channel.name}**."
+    problems = voice_problems(guild, channel)
+    if problems:
+        log.warning("tts: после /join бота не будет слышно: " + "; ".join(problems))
+        reply += "\n⚠️ Но бота не будет слышно: " + "; ".join(problems) + "."
+    await interaction.followup.send(reply, ephemeral=True)
 
 
 @app_commands.command(name="leave", description="Выйти из голосового канала")
