@@ -5,7 +5,7 @@ import os
 import re
 from logging.handlers import RotatingFileHandler
 
-# load_dotenv() ОБЯЗАТЕЛЬНО до импорта togif/role_transfer - они читают os.environ
+# load_dotenv() ОБЯЗАТЕЛЬНО до импорта togif/tts/renamer - они читают os.environ
 # на уровне модуля (при импорте), а не при вызове функций. Если .env загрузить
 # позже, эти модули просто не увидят переменные и решат, что они не заданы.
 try:
@@ -21,7 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import togif
-import soyball
+import tts
 import renamer
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -66,7 +66,10 @@ log = logging.getLogger("main")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # привилегированный; TTS нужен, чтобы видеть, кто сидит в голосовом канале
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+
+tts.register(bot)  # добавляет слэш-команды озвучки в bot.tree
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +168,8 @@ async def on_message(message: discord.Message):
         return
 
     await bot.process_commands(message)
-    await soyball.maybe_transfer_role(message)
+    if not message.content.startswith(COMMAND_PREFIX):  # !команды вслух не читаем
+        await tts.handle_message(message)
 
     # Важно: проверяем именно ЯВНОЕ упоминание в тексте (<@id>), а не message.mentions —
     # Discord автоматически добавляет туда автора сообщения при обычном reply-пинге,
@@ -199,17 +203,8 @@ async def on_message(message: discord.Message):
 
 
 @bot.event
-async def on_message_edit(before: discord.Message, after: discord.Message):
-    """
-    Discord часто добавляет embed НЕ сразу при отправке сообщения, а отдельным
-    событием редактирования (пока сам подгружает превью ссылки на Tenor/GIPHY
-    и т.п.). Поэтому передачу роли по гифке-ссылке нужно перепроверять и здесь,
-    иначе такие сообщения (98% реальных гифок - это именно ссылки) будут пропущены.
-    """
-    if after.author.bot:
-        return
-    if not before.embeds and after.embeds:
-        await soyball.maybe_transfer_role(after)
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    await tts.handle_voice_state_update(bot, member, before, after)
 
 
 @bot.event
@@ -259,6 +254,7 @@ async def on_ready():
         f"на серверах: {len(bot.guilds)}, задержка: {bot.latency * 1000:.0f} мс"
     )
     renamer.start(bot)
+    tts.start()
 
 
 def main():
