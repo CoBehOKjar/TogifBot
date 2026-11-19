@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -221,10 +222,19 @@ class GuildPlayer:
         while True:
             voice_name, text, speed = await self.queue.get()
             try:
+                started = time.monotonic()
                 pcm, rate = await loop.run_in_executor(
                     SYNTH_POOL, synthesize, voice_name, text, speed
                 )
-                if not pcm or not self.vc.is_connected():
+                log.info(
+                    f"tts: синтез готов за {time.monotonic() - started:.2f} сек "
+                    f"(голос={voice_name}, {len(pcm)} байт, {rate} Гц)"
+                )
+                if not pcm:
+                    log.warning("tts: синтез вернул пустое аудио - пропускаю")
+                    continue
+                if not self.vc.is_connected():
+                    log.warning("tts: голосовое соединение не активно (is_connected=False) - пропускаю")
                     continue
                 done = asyncio.Event()
                 source = discord.FFmpegPCMAudio(
@@ -233,8 +243,15 @@ class GuildPlayer:
                     before_options=f"-f s16le -ar {rate} -ac 1",
                     options="-loglevel error",
                 )
-                self.vc.play(source, after=lambda _e: loop.call_soon_threadsafe(done.set))
+                def _after(error):
+                    if error:
+                        log.error(f"tts: ошибка воспроизведения: {error}")
+                    loop.call_soon_threadsafe(done.set)
+
+                log.info("tts: начинаю воспроизведение")
+                self.vc.play(source, after=_after)
                 await done.wait()  # следующее сообщение - только после конца текущего
+                log.info("tts: воспроизведение завершено")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -264,20 +281,29 @@ async def handle_message(message: discord.Message) -> None:
     if message.type not in (discord.MessageType.default, discord.MessageType.reply):
         return
     player = players.get(message.guild.id)
-    if not player or message.channel.id != player.channel_id:
+    if not player:
+        return  # бот не в войсе на этом сервере - обычная ситуация, не логируем
+    if message.channel.id != player.channel_id:
+        log.debug(
+            f"tts: сообщение не из чата голосового канала "
+            f"(канал сообщения {message.channel.id}, нужен {player.channel_id})"
+        )
         return
 
     g = store.guild(message.guild.id)
     if message.author.id in g["ignored"]:
+        log.debug(f"tts: автор {message.author.id} в списке игнорируемых")
         return
     if ONLY_FROM_VOICE_MEMBERS:
         vs = getattr(message.author, "voice", None)
         if not (vs and vs.channel and vs.channel.id == player.channel_id):
+            log.info("tts: пропускаю - автор не сидит в голосовом канале (ONLY_FROM_VOICE_MEMBERS=true)")
             return
 
     settings = store.user(message.author.id)
     text = clean_message(message, settings["emoji"])
     if not text:
+        log.info("tts: пропускаю - после очистки текст пустой")
         return
     if g["said"]:
         name = emoji_lib.replace_emoji(message.author.display_name, "").strip()
@@ -285,9 +311,17 @@ async def handle_message(message: discord.Message) -> None:
 
     voice_name = library.resolve(settings["voice"])
     if voice_name is None:
+        log.warning(
+            f"tts: нет ни одного доступного голоса - читать нечем. Папка: {VOICES_DIR.resolve()}, "
+            "нужны пары файлов <имя>.onnx + <имя>.onnx.json"
+        )
         return
-    with contextlib.suppress(asyncio.QueueFull):
+    try:
         player.queue.put_nowait((voice_name, text, settings["speed"]))
+    except asyncio.QueueFull:
+        log.warning(f"tts: очередь озвучки переполнена (MAX_QUEUE={MAX_QUEUE}) - сообщение пропущено")
+        return
+    log.info(f"tts: в очереди ({len(text)} симв., голос={voice_name}, в очереди сейчас {player.queue.qsize()})")
 
 
 async def handle_voice_state_update(
@@ -364,6 +398,7 @@ async def join(interaction: discord.Interaction):
         player.vc, player.channel_id = vc, channel.id
     else:
         players[guild.id] = GuildPlayer(vc, channel.id)
+    log.info(f"tts: подключился к каналу {channel.name} ({channel.id}) на сервере {guild.id}")
     await interaction.followup.send(f"Подключился к **{channel.name}**.", ephemeral=True)
 
 
@@ -497,6 +532,8 @@ def register(bot: commands.Bot) -> None:
         return
     if importlib.util.find_spec("nacl") is None:
         log.warning("tts: не установлен PyNaCl - голосовые каналы не заработают. Нужно: pip install \"discord.py[voice]\"")
+    if shutil.which("ffmpeg") is None:
+        log.warning("tts: ffmpeg не найден в PATH - озвучка не заработает. Нужно: apt install ffmpeg")
     for cmd in _COMMANDS:
         bot.tree.add_command(cmd)
     log.info("tts: слэш-команды зарегистрированы")
@@ -513,6 +550,9 @@ def start() -> None:
     if _watch_task is not None and not _watch_task.done():
         return
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
-    if library.scan():
-        log.info("Доступные голоса: %s", ", ".join(library.names()) or "—")
+    library.scan()
+    log.info(
+        f"tts: папка голосов {VOICES_DIR.resolve()}, найдено голосов: {len(library.voices)} "
+        f"({', '.join(library.names()) or 'пусто'})"
+    )
     _watch_task = asyncio.create_task(library.watch())
