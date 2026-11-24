@@ -18,6 +18,7 @@ TTS-озвучка на Piper (piper1-gpl): бот заходит в голос�
     MAX_QUEUE=30                         - макс. очередь озвучки на сервер
     MAX_CACHED_VOICES=2                  - сколько голосов держать в памяти
     ONLY_FROM_VOICE_MEMBERS=false        - читать только тех, кто сидит в голосовом канале
+    TTS_MALLOC_TRIM=true                 - возвращать освобождённую память системе (против разрастания RAM)
 
 Требуется: pip install "discord.py[voice]" piper-tts emoji, а в системе - ffmpeg.
 Если piper/emoji не установлены, модуль отключается, остальной бот работает.
@@ -26,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
+import gc
 import importlib.util
 import io
 import json
@@ -65,6 +68,36 @@ MAX_CHARS = int(os.getenv("MAX_CHARS", "400"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "30"))
 MAX_CACHED_VOICES = int(os.getenv("MAX_CACHED_VOICES", "2"))
 ONLY_FROM_VOICE_MEMBERS = os.getenv("ONLY_FROM_VOICE_MEMBERS", "false").lower() == "true"
+# Возвращать освобождённую память системе (glibc malloc_trim) после синтеза и выгрузки голосов
+TRIM_MEMORY = os.getenv("TTS_MALLOC_TRIM", "true").lower() == "true"
+
+
+def rss_mb() -> Optional[int]:
+    """Текущая память процесса в МБ (только Linux), для диагностики утечек."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        pass
+    return None
+
+
+_libc = None
+
+
+def trim_memory() -> None:
+    """Просит glibc вернуть системе освобождённую, но не отданную память (фрагментация)."""
+    global _libc
+    if not TRIM_MEMORY:
+        return
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6")
+        _libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # не glibc - ничего страшного
 
 
 # ───────────────────────── Хранилище настроек ─────────────────────────
@@ -158,10 +191,18 @@ class VoiceLibrary:
         if cached and cached[0] == mtime:
             self._cache[name] = cached
             return cached[1]
+        log.info(f"tts: загружаю голос {name} с диска (в кэше: {list(self._cache)}, память {rss_mb()} МБ)")
         voice = PiperVoice.load(path)
         self._cache[name] = (mtime, voice)
+        evicted = False
         while len(self._cache) > MAX_CACHED_VOICES:
-            self._cache.popitem(last=False)
+            old, _ = self._cache.popitem(last=False)
+            log.info(f"tts: выгружаю голос {old} из кэша (MAX_CACHED_VOICES={MAX_CACHED_VOICES})")
+            evicted = True
+        if evicted:
+            gc.collect()
+            trim_memory()
+        log.info(f"tts: голос {name} загружен, память {rss_mb()} МБ")
         return voice
 
 
@@ -177,6 +218,7 @@ def synthesize(voice_name: str, text: str, speed: float) -> tuple[bytes, int]:
     # length_scale меняет длительность на уровне модели, высота голоса не меняется
     cfg = SynthesisConfig(length_scale=base / speed)
     pcm = b"".join(c.audio_int16_bytes for c in voice.synthesize(text, syn_config=cfg))
+    trim_memory()
     return pcm, voice.config.sample_rate
 
 
@@ -228,7 +270,7 @@ class GuildPlayer:
                 )
                 log.info(
                     f"tts: синтез готов за {time.monotonic() - started:.2f} сек "
-                    f"(голос={voice_name}, {len(pcm)} байт, {rate} Гц)"
+                    f"(голос={voice_name}, {len(pcm)} байт, {rate} Гц, память {rss_mb()} МБ)"
                 )
                 if not pcm:
                     log.warning("tts: синтез вернул пустое аудио - пропускаю")
