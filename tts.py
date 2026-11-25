@@ -59,6 +59,21 @@ except ImportError as e:  # модуль отключается, но бот п�
     ENABLED = False
     _import_error = e
 
+try:
+    import onnxruntime as _ort
+
+    _orig_session_options = _ort.SessionOptions
+
+    def _lean_session_options():
+        opts = _orig_session_options()
+        opts.enable_cpu_mem_arena = False   # не копить память в arena
+        opts.enable_mem_pattern = False     # не кэшировать паттерны под разные длины входа
+        return opts
+
+    _ort.SessionOptions = _lean_session_options
+except ImportError:
+    pass
+
 log = logging.getLogger(__name__)
 
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "voices"))
