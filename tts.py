@@ -8,7 +8,7 @@ TTS-озвучка на Piper (piper1-gpl): бот заходит в голос�
     tts.handle_message(message)  - из on_message
     tts.handle_voice_state_update(bot, member, before, after) - из on_voice_state_update
 
-Слэш-команды: /join, /leave, /said, /ignore, /voice, /emoji, /speed.
+Слэш-команды: /join, /leave, /skip, /said, /ignore, /voice, /emoji, /speed.
 
 Настройка через .env (всё необязательно):
     VOICES_DIR=voices                    - папка с голосами (*.onnx + *.onnx.json)
@@ -79,9 +79,9 @@ log = logging.getLogger(__name__)
 VOICES_DIR = Path(os.getenv("VOICES_DIR", "voices"))
 DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "ru_RU-denis-medium")
 DATA_FILE = Path(os.getenv("DATA_FILE", "data.json"))
-MAX_CHARS = int(os.getenv("MAX_CHARS", "400"))
+MAX_CHARS = int(os.getenv("MAX_CHARS", "1000"))
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "30"))
-MAX_CACHED_VOICES = int(os.getenv("MAX_CACHED_VOICES", "2"))
+MAX_CACHED_VOICES = int(os.getenv("MAX_CACHED_VOICES", "5"))
 ONLY_FROM_VOICE_MEMBERS = os.getenv("ONLY_FROM_VOICE_MEMBERS", "false").lower() == "true"
 # Возвращать освобождённую память системе (glibc malloc_trim) после синтеза и выгрузки голосов
 TRIM_MEMORY = os.getenv("TTS_MALLOC_TRIM", "true").lower() == "true"
@@ -118,7 +118,7 @@ def trim_memory() -> None:
 # ───────────────────────── Хранилище настроек ─────────────────────────
 
 class Store:
-    USER_DEFAULTS = {"voice": None, "emoji": False, "speed": 1.0}
+    USER_DEFAULTS = {"voice": None, "emoji": True, "speed": 1.0}
     GUILD_DEFAULTS = {"said": False, "ignored": []}
 
     def __init__(self, path: Path):
@@ -238,12 +238,15 @@ def synthesize(voice_name: str, text: str, speed: float) -> tuple[bytes, int]:
 
 
 # ───────────────────────── Очистка текста ─────────────────────────
-
 CODE_BLOCK_RE = re.compile(r"```.*?```", re.S)
 URL_RE = re.compile(r"https?://\S+")
 CUSTOM_EMOJI_RE = re.compile(r"<a?:(\w+):\d+>")
 MD_RE = re.compile(r"[*~|`>]+")
 SPACE_RE = re.compile(r"\s+")
+
+USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
+ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
+CHANNEL_MENTION_RE = re.compile(r"<#(\d+)>")
 
 
 def handle_unicode_emoji(text: str, read: bool) -> str:
@@ -253,14 +256,54 @@ def handle_unicode_emoji(text: str, read: bool) -> str:
     return emoji_lib.replace_emoji(text, "")
 
 
-def clean_message(message: discord.Message, read_emoji: bool) -> str:
-    text = message.clean_content  # упоминания уже превращены в имена
-    text = CODE_BLOCK_RE.sub(" код ", text)
-    text = URL_RE.sub(" ссылка ", text)
+def resolve_mentions(raw: str, guild: Optional[discord.Guild]) -> str:
+    """У снапшота пересланного сообщения нет clean_content, поэтому упоминания разбираем вручную."""
+    if guild is None:
+        return raw
+
+    def _user(m):
+        member = guild.get_member(int(m.group(1)))
+        return member.display_name if member else "пользователь"
+
+    def _role(m):
+        role = guild.get_role(int(m.group(1)))
+        return role.name if role else "роль"
+
+    def _channel(m):
+        ch = guild.get_channel(int(m.group(1)))
+        return ch.name if ch else "канал"
+
+    raw = USER_MENTION_RE.sub(_user, raw)
+    raw = ROLE_MENTION_RE.sub(_role, raw)
+    raw = CHANNEL_MENTION_RE.sub(_channel, raw)
+    return raw
+
+
+def _clean_text(text: str, read_emoji: bool) -> str:
+    text = CODE_BLOCK_RE.sub(" блок кода ", text)
+    text = URL_RE.sub(" а линьк ", text)
     text = CUSTOM_EMOJI_RE.sub((lambda m: f" {m.group(1)} ") if read_emoji else " ", text)
     text = MD_RE.sub(" ", text)
     text = handle_unicode_emoji(text, read_emoji)
-    if message.attachments:
+    return SPACE_RE.sub(" ", text).strip()
+
+
+def clean_message(message: discord.Message, read_emoji: bool) -> str:
+    parts = []
+    own = _clean_text(message.clean_content, read_emoji)  # упоминания уже превращены в имена
+    if own:
+        parts.append(own)
+
+    has_attachments = bool(message.attachments)
+    # Пересланные сообщения: содержимое лежит не в message.content, а в снапшотах
+    for snap in getattr(message, "message_snapshots", None) or []:
+        raw = resolve_mentions(snap.content or "", message.guild)
+        forwarded = _clean_text(raw, read_emoji)
+        parts.append(f"пересланное сообщение: {forwarded}" if forwarded else "пересланное сообщение")
+        has_attachments = has_attachments or bool(snap.attachments)
+
+    text = " ".join(parts)
+    if has_attachments:
         text += " вложение"
     return SPACE_RE.sub(" ", text).strip()[:MAX_CHARS]
 
@@ -272,12 +315,35 @@ class GuildPlayer:
         self.vc = vc
         self.channel_id = channel_id
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE)
+        self.busy = False           # сейчас обрабатывается/играет сообщение
+        self.skip_current = False   # текущее сообщение нужно пропустить
         self.task = asyncio.create_task(self.run())
+
+    def skip(self, count: Optional[int]) -> int:
+        """
+        Пропускает текущее сообщение и (count - 1) следующих из очереди.
+        count=None - пропустить всё. Возвращает, сколько сообщений пропущено.
+        """
+        skipped = 0
+        if self.busy:
+            self.skip_current = True
+            if self.vc.is_playing() or self.vc.is_paused():
+                self.vc.stop()  # вызовет _after и разблокирует run()
+            skipped = 1
+        while count is None or skipped < count:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            skipped += 1
+        return skipped
 
     async def run(self):
         loop = asyncio.get_running_loop()
         while True:
             voice_name, text, speed = await self.queue.get()
+            self.busy = True
+            self.skip_current = False
             try:
                 started = time.monotonic()
                 pcm, rate = await loop.run_in_executor(
@@ -287,6 +353,9 @@ class GuildPlayer:
                     f"tts: синтез готов за {time.monotonic() - started:.2f} сек "
                     f"(голос={voice_name}, {len(pcm)} байт, {rate} Гц, память {rss_mb()} МБ)"
                 )
+                if self.skip_current:
+                    log.info("tts: сообщение пропущено командой /skip (до начала воспроизведения)")
+                    continue
                 if not pcm:
                     log.warning("tts: синтез вернул пустое аудио - пропускаю")
                     continue
@@ -300,6 +369,7 @@ class GuildPlayer:
                     before_options=f"-f s16le -ar {rate} -ac 1",
                     options="-loglevel error",
                 )
+
                 def _after(error):
                     if error:
                         log.error(f"tts: ошибка воспроизведения: {error}")
@@ -316,6 +386,8 @@ class GuildPlayer:
                 raise
             except Exception:
                 log.exception("Ошибка озвучки")
+            finally:
+                self.busy = False
 
 
 def voice_problems(guild: discord.Guild, channel) -> list:
@@ -499,6 +571,47 @@ async def leave(interaction: discord.Interaction):
     await interaction.response.send_message("Отключился.", ephemeral=True)
 
 
+@app_commands.command(name="skip", description="Пропустить текущее сообщение (или несколько)")
+@app_commands.guild_only()
+@app_commands.describe(count="Сколько сообщений пропустить: число или all (по умолчанию 1)")
+async def skip(interaction: discord.Interaction, count: Optional[str] = None):
+    channel = await require_voice(interaction)
+    if channel is None:
+        return
+
+    player = players.get(interaction.guild_id)
+    if not player or player.channel_id != channel.id:
+        return await interaction.response.send_message(
+            "Бот сейчас не в вашем канале.", ephemeral=True
+        )
+
+    if count is None:
+        amount: Optional[int] = 1
+    elif count.strip().lower() == "all":
+        amount = None
+    elif count.strip().isdigit() and int(count) > 0:
+        amount = int(count)
+    else:
+        return await interaction.response.send_message(
+            "Укажите положительное число или `all`.", ephemeral=True
+        )
+
+    skipped = player.skip(amount)
+    if skipped == 0:
+        return await interaction.response.send_message("Нечего пропускать.", ephemeral=True)
+    log.info(f"tts: /skip - пропущено {skipped} (сервер {interaction.guild_id})")
+    await interaction.response.send_message(f"Пропущено сообщений: **{skipped}**.", ephemeral=True)
+
+
+@skip.autocomplete("count")
+async def skip_autocomplete(interaction: discord.Interaction, current: str):
+    options = ["all", "1", "2", "3", "5", "10"]
+    current = current.lower()
+    return [
+        app_commands.Choice(name=o, value=o) for o in options if current in o
+    ]
+
+
 @app_commands.command(name="said", description="Читать ли никнейм автора перед сообщением")
 @app_commands.guild_only()
 async def said(interaction: discord.Interaction):
@@ -587,10 +700,10 @@ async def emoji_cmd(interaction: discord.Interaction, mode: Literal["read", "ign
 
 
 @app_commands.command(name="speed", description="Скорость чтения (высота голоса не меняется)")
-@app_commands.describe(multiplier="От 0.5 до 2.0, обычная скорость - 1.0")
+@app_commands.describe(multiplier="От 0.1 до 10.0, обычная скорость - 1.0")
 async def speed_cmd(
     interaction: discord.Interaction,
-    multiplier: app_commands.Range[float, 0.5, 2.0],
+    multiplier: app_commands.Range[float, 0.1, 10.0],
 ):
     if await require_voice(interaction) is None:
         return
@@ -598,7 +711,7 @@ async def speed_cmd(
     await interaction.response.send_message(f"Скорость: **×{multiplier:.2f}**.", ephemeral=True)
 
 
-_COMMANDS = (join, leave, said, ignore, voice_cmd, emoji_cmd, speed_cmd)
+_COMMANDS = (join, leave, skip, said, ignore, voice_cmd, emoji_cmd, speed_cmd)
 _watch_task: Optional[asyncio.Task] = None
 
 
